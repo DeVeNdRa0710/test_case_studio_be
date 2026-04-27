@@ -1,3 +1,4 @@
+import asyncio
 from typing import Protocol, Sequence
 
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -6,9 +7,39 @@ from app.core.config import settings
 from app.core.logging import logger
 
 
+EMBED_BATCH_SIZE = 100
+EMBED_MAX_CONCURRENCY = 5
+
+
 class Embedder(Protocol):
     async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
     async def embed_one(self, text: str) -> list[float]: ...
+
+
+async def _fan_out(
+    texts: Sequence[str],
+    embed_one_batch,
+    *,
+    batch_size: int = EMBED_BATCH_SIZE,
+    max_concurrency: int = EMBED_MAX_CONCURRENCY,
+) -> list[list[float]]:
+    if not texts:
+        return []
+    if len(texts) <= batch_size:
+        return await embed_one_batch(list(texts))
+
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def _run(slice_: list[str]) -> list[list[float]]:
+        async with sem:
+            return await embed_one_batch(slice_)
+
+    slices = [list(texts[i : i + batch_size]) for i in range(0, len(texts), batch_size)]
+    results = await asyncio.gather(*[_run(s) for s in slices])
+    out: list[list[float]] = []
+    for r in results:
+        out.extend(r)
+    return out
 
 
 class GeminiEmbedder:
@@ -25,18 +56,19 @@ class GeminiEmbedder:
         )
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        if not texts:
-            return []
+    async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         resp = await self._client.aio.models.embed_content(
             model=self._model,
-            contents=list(texts),
+            contents=texts,
             config=self._config,
         )
         return [list(e.values) for e in resp.embeddings]
 
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        return await _fan_out(texts, self._embed_batch)
+
     async def embed_one(self, text: str) -> list[float]:
-        vectors = await self.embed([text])
+        vectors = await self._embed_batch([text])
         return vectors[0] if vectors else []
 
 
@@ -50,14 +82,15 @@ class OpenAIEmbedder:
         self._model = settings.openai_embed_model
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        if not texts:
-            return []
-        resp = await self._client.embeddings.create(model=self._model, input=list(texts))
+    async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        resp = await self._client.embeddings.create(model=self._model, input=texts)
         return [d.embedding for d in resp.data]
 
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        return await _fan_out(texts, self._embed_batch)
+
     async def embed_one(self, text: str) -> list[float]:
-        vectors = await self.embed([text])
+        vectors = await self._embed_batch([text])
         return vectors[0] if vectors else []
 
 

@@ -74,6 +74,11 @@ class Settings:
     chunk_overlap: int
     top_k: int
 
+    redis_url: str
+    cache_embed_ttl: int
+    cache_result_ttl: int
+    cache_enabled: bool
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -115,6 +120,11 @@ def get_settings() -> Settings:
         chunk_size=_get_int("CHUNK_SIZE", 800),
         chunk_overlap=_get_int("CHUNK_OVERLAP", 120),
         top_k=_get_int("TOP_K", 6),
+
+        redis_url=_get("REDIS_URL"),
+        cache_embed_ttl=_get_int("CACHE_EMBED_TTL", 3600),
+        cache_result_ttl=_get_int("CACHE_RESULT_TTL", 900),
+        cache_enabled=_get("CACHE_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
     )
 
 

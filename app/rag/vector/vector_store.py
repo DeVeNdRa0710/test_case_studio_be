@@ -1,7 +1,10 @@
 from typing import Sequence
 
+from app.core.config import settings
+from app.core.logging import logger
 from app.models.chunk import Chunk, RetrievedChunk
 from app.rag.vector.pinecone_client import get_pinecone_client
+from app.services.cache import get_or_set, make_key
 from app.services.embeddings import get_embedding_service
 
 
@@ -23,7 +26,13 @@ class VectorStore:
         namespace: str = "default",
         filter_: dict | None = None,
     ) -> list[RetrievedChunk]:
-        vec = await self._embed.embed_one(query)
+        vec, hit = await get_or_set(
+            make_key("embed", settings.embeddings_provider, settings.gemini_embed_model, query),
+            settings.cache_embed_ttl,
+            lambda: self._embed.embed_one(query),
+        )
+        if hit:
+            logger.debug("embed cache hit")
         if not vec:
             return []
         return await self._pc.query(vec, top_k=top_k, namespace=namespace, filter_=filter_)
