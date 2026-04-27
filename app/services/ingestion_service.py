@@ -4,6 +4,8 @@ from typing import Any
 
 from app.core.exceptions import IngestionError
 from app.core.logging import logger
+from app.db.models import AuditEvent, Document
+from app.db.session import SessionLocal
 from app.models.chunk import Chunk
 from app.models.graph import GraphExtraction, GraphNode, GraphRelationship, NodeLabel, RelType
 from app.rag.graph.graph_store import get_graph_store
@@ -15,6 +17,54 @@ from app.schemas.ingestion import (
 )
 from app.services.graph_extractor import get_graph_extractor
 from app.utils.chunker import chunk_text
+
+
+async def _record_document(
+    *,
+    doc_id: str,
+    project: str,
+    kind: str,
+    module: str | None,
+    title: str | None,
+    source: str | None,
+    chunks_indexed: int,
+    nodes_upserted: int,
+    relationships_upserted: int,
+    extra: dict | None = None,
+) -> None:
+    try:
+        async with SessionLocal() as s:
+            s.add(
+                Document(
+                    id=doc_id,
+                    project_name=project,
+                    kind=kind,
+                    module=module,
+                    title=title,
+                    source=source,
+                    chunks_indexed=chunks_indexed,
+                    nodes_upserted=nodes_upserted,
+                    relationships_upserted=relationships_upserted,
+                    extra=extra,
+                )
+            )
+            s.add(
+                AuditEvent(
+                    project_name=project,
+                    action=f"ingest.{kind}",
+                    target=doc_id,
+                    payload={
+                        "module": module,
+                        "title": title,
+                        "chunks_indexed": chunks_indexed,
+                        "nodes_upserted": nodes_upserted,
+                        "relationships_upserted": relationships_upserted,
+                    },
+                )
+            )
+            await s.commit()
+    except Exception as exc:
+        logger.warning(f"Document audit insert failed for {doc_id}: {exc}")
 
 
 class IngestionService:
@@ -47,6 +97,18 @@ class IngestionService:
         )
         extraction = _ensure_module(extraction, payload.module)
         nodes, rels = await self._graph.upsert(extraction, project=payload.project)
+
+        await _record_document(
+            doc_id=doc_id,
+            project=payload.project,
+            kind="requirement",
+            module=payload.module,
+            title=payload.title,
+            source=payload.source,
+            chunks_indexed=indexed,
+            nodes_upserted=nodes,
+            relationships_upserted=rels,
+        )
         return doc_id, indexed, nodes, rels
 
     async def ingest_requirement_text(
@@ -103,6 +165,19 @@ class IngestionService:
             )
         )
         nodes, rels = await self._graph.upsert(extraction, project=payload.project)
+
+        await _record_document(
+            doc_id=doc_id,
+            project=payload.project,
+            kind="figma",
+            module=payload.module,
+            title=payload.screen_name,
+            source=None,
+            chunks_indexed=indexed,
+            nodes_upserted=nodes,
+            relationships_upserted=rels,
+            extra={"screen_name": payload.screen_name},
+        )
         return doc_id, indexed, nodes, rels
 
     async def ingest_api_spec(self, payload: ApiSpecIngestRequest) -> tuple[str, int, int, int]:
@@ -150,6 +225,18 @@ class IngestionService:
                 )
             )
         nodes, rels = await self._graph.upsert(extraction, project=payload.project)
+
+        await _record_document(
+            doc_id=doc_id,
+            project=payload.project,
+            kind="api_spec",
+            module=payload.module,
+            title=payload.description or None,
+            source=None,
+            chunks_indexed=indexed,
+            nodes_upserted=nodes,
+            relationships_upserted=rels,
+        )
         return doc_id, indexed, nodes, rels
 
 

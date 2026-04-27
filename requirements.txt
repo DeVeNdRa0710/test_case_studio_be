@@ -16,3 +16,9 @@ tenacity==9.0.0
 loguru==0.7.2
 json-repair==0.30.0
 redis==5.1.1
+slowapi==0.1.9
+filetype==1.2.0
+pybreaker==1.2.0
+sqlalchemy[asyncio]==2.0.36
+alembic==1.14.0
+aiosqlite==0.20.0

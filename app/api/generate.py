@@ -1,5 +1,8 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 
+from app.core.config import settings
+from app.core.rate_limit import limiter
 from app.generators.playwright_generator import get_playwright_generator
 from app.generators.postman_generator import get_postman_generator
 from app.schemas.testcase import (
@@ -10,10 +13,28 @@ from app.schemas.testcase import (
     GenerateTestCasesRequest,
     GenerateTestCasesResponse,
 )
+from app.services.jobs import enqueue, get_job
 from app.services.project_service import get_project_service
 from app.services.testcase_service import get_testcase_service
 
 router = APIRouter(tags=["generate"])
+
+
+class AsyncJobAccepted(BaseModel):
+    job_id: str
+    status: str = "queued"
+    poll_url: str
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    kind: str
+    project: str | None = None
+    status: str
+    result: dict | None = None
+    error: str | None = None
+    created_at: str
+    updated_at: str
 
 
 @router.post(
@@ -27,7 +48,8 @@ router = APIRouter(tags=["generate"])
         "3. Merges both contexts and calls the LLM (JSON mode) to emit structured test cases."
     ),
 )
-async def generate_testcases(payload: GenerateTestCasesRequest) -> GenerateTestCasesResponse:
+@limiter.limit(settings.rate_limit_generate)
+async def generate_testcases(request: Request, payload: GenerateTestCasesRequest) -> GenerateTestCasesResponse:
     """
     Field-by-field example:
 
@@ -56,7 +78,7 @@ async def generate_testcases(payload: GenerateTestCasesRequest) -> GenerateTestC
     }
     ```
     """
-    payload.project = get_project_service().require(payload.project)
+    payload.project = await get_project_service().require_async(payload.project)
     svc = get_testcase_service()
     cases, docs, nodes = await svc.generate(payload)
     return GenerateTestCasesResponse(
@@ -166,3 +188,53 @@ async def generate_postman(payload: GeneratePostmanRequest) -> GeneratePostmanRe
         base_url=payload.base_url,
     )
     return GeneratePostmanResponse(collection=collection)
+
+
+@router.post(
+    "/generate-testcases/async",
+    response_model=AsyncJobAccepted,
+    status_code=202,
+    summary="Queue an async test-case generation job",
+    description=(
+        "Same input as /generate-testcases. Returns immediately with a job_id; "
+        "poll GET /jobs/{job_id} until status='done' to retrieve the result. "
+        "Useful for long-running queries that would otherwise hold an HTTP "
+        "connection open for 10–60 seconds."
+    ),
+)
+@limiter.limit(settings.rate_limit_generate)
+async def generate_testcases_async(
+    request: Request, payload: GenerateTestCasesRequest
+) -> AsyncJobAccepted:
+    payload.project = await get_project_service().require_async(payload.project)
+    svc = get_testcase_service()
+
+    async def runner(req: dict) -> dict:
+        from app.schemas.testcase import GenerateTestCasesRequest as Req
+
+        cases, docs, nodes = await svc.generate(Req(**req))
+        return {
+            "test_cases": [c.model_dump() for c in cases],
+            "retrieved_docs": docs,
+            "retrieved_graph_nodes": nodes,
+        }
+
+    job_id = await enqueue(
+        kind="generate_testcases",
+        project=payload.project,
+        request_payload=payload.model_dump(),
+        runner=runner,
+    )
+    return AsyncJobAccepted(job_id=job_id, poll_url=f"/jobs/{job_id}")
+
+
+@router.get(
+    "/jobs/{job_id}",
+    response_model=JobStatusResponse,
+    summary="Get the status (and result, when ready) of an async job",
+)
+async def job_status(job_id: str) -> JobStatusResponse:
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    return JobStatusResponse(**job)

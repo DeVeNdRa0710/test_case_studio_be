@@ -1,10 +1,9 @@
 import asyncio
 from typing import Protocol, Sequence
 
-from tenacity import retry, stop_after_attempt, wait_exponential
-
 from app.core.config import settings
 from app.core.logging import logger
+from app.core.resilience import llm_breaker, retryable_external, with_breaker
 
 
 EMBED_BATCH_SIZE = 100
@@ -55,7 +54,8 @@ class GeminiEmbedder:
             output_dimensionality=settings.pinecone_dimension
         )
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+    @retryable_external()
+    @with_breaker(llm_breaker, "Embeddings")
     async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         resp = await self._client.aio.models.embed_content(
             model=self._model,
@@ -81,7 +81,8 @@ class OpenAIEmbedder:
         self._client = AsyncOpenAI(api_key=settings.openai_api_key or "missing")
         self._model = settings.openai_embed_model
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+    @retryable_external()
+    @with_breaker(llm_breaker, "Embeddings")
     async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         resp = await self._client.embeddings.create(model=self._model, input=texts)
         return [d.embedding for d in resp.data]

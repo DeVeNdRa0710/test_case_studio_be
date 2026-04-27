@@ -2,11 +2,13 @@ import asyncio
 import json
 from typing import Any
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 
+from app.core.config import settings
 from app.core.exceptions import IngestionError
 from app.core.logging import logger
+from app.core.rate_limit import limiter
 from app.schemas.ingestion import (
     ApiSpecIngestRequest,
     BatchDocResult,
@@ -31,6 +33,7 @@ from app.services.ingestion_service import get_ingestion_service
 from app.services.project_service import get_project_service
 from app.services.vision import LLMModelNotFoundError, LLMQuotaError
 from app.utils.pdf import extract_text_from_pdf
+from app.utils.uploads import assert_pdf_page_limit, read_and_validate
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
@@ -62,7 +65,9 @@ class NormalizeApiSpecResponse(BaseModel):
         "Module/Entity/API/UIScreen nodes and their relationships into Neo4j."
     ),
 )
+@limiter.limit(settings.rate_limit_ingest)
 async def ingest_requirements(
+    request: Request,
     project: str | None = Form(
         default=None,
         description="Project (tenant) name. Pinecone namespace + Neo4j node scope.",
@@ -131,7 +136,7 @@ async def ingest_requirements(
     svc = get_ingestion_service()
 
     if body is not None:
-        body.project = get_project_service().require(body.project)
+        body.project = await get_project_service().require_async(body.project)
         doc_id, indexed, nodes, rels = await svc.ingest_requirement(body)
         return IngestResponse(
             doc_id=doc_id, chunks_indexed=indexed, nodes_upserted=nodes, relationships_upserted=rels
@@ -141,12 +146,13 @@ async def ingest_requirements(
         raise HTTPException(
             status_code=422, detail="`project`, `module`, and `title` are required"
         )
-    project = get_project_service().require(project)
+    project = await get_project_service().require_async(project)
 
     content = text or ""
     if file is not None:
-        raw = await file.read()
-        if (file.content_type or "").endswith("pdf") or (file.filename or "").lower().endswith(".pdf"):
+        raw, mime = await read_and_validate(file, kinds={"pdf", "text"})
+        if mime == "application/pdf":
+            assert_pdf_page_limit(raw)
             content = extract_text_from_pdf(raw)
         else:
             content = raw.decode("utf-8", errors="ignore")
@@ -176,7 +182,9 @@ async def ingest_requirements(
         "- `module` and `source` apply to every file."
     ),
 )
+@limiter.limit(settings.rate_limit_ingest)
 async def ingest_requirements_batch(
+    request: Request,
     files: list[UploadFile] = File(
         ...,
         description="One or more .pdf or .txt files. Use the same field name 'files' for each.",
@@ -196,7 +204,7 @@ async def ingest_requirements_batch(
         raise HTTPException(status_code=422, detail="At least one file is required")
     if not project.strip() or not module.strip():
         raise HTTPException(status_code=422, detail="`project` and `module` are required")
-    project = get_project_service().require(project)
+    project = await get_project_service().require_async(project)
 
     svc = get_ingestion_service()
     results: list[BatchDocResult] = []
@@ -209,15 +217,12 @@ async def ingest_requirements_batch(
         title = f"{prefix} — {base}" if prefix else base
 
         try:
-            raw = await f.read()
-            if not raw:
-                raise IngestionError("Empty file")
-            is_pdf = (f.content_type or "").endswith("pdf") or file_name.lower().endswith(".pdf")
-            content = (
-                extract_text_from_pdf(raw)
-                if is_pdf
-                else raw.decode("utf-8", errors="ignore")
-            )
+            raw, mime = await read_and_validate(f, kinds={"pdf", "text"})
+            if mime == "application/pdf":
+                assert_pdf_page_limit(raw)
+                content = extract_text_from_pdf(raw)
+            else:
+                content = raw.decode("utf-8", errors="ignore")
             if not content.strip():
                 raise IngestionError("No extractable text")
 
@@ -279,7 +284,8 @@ async def ingest_requirements_batch(
         "and extracts any additional Entity/API references mentioned in the description."
     ),
 )
-async def ingest_figma(payload: FigmaIngestRequest) -> IngestResponse:  # noqa: D401
+@limiter.limit(settings.rate_limit_ingest)
+async def ingest_figma(request: Request, payload: FigmaIngestRequest) -> IngestResponse:  # noqa: D401
     """
     Field-by-field example:
 
@@ -317,7 +323,7 @@ async def ingest_figma(payload: FigmaIngestRequest) -> IngestResponse:  # noqa: 
     }
     ```
     """
-    payload.project = get_project_service().require(payload.project)
+    payload.project = await get_project_service().require_async(payload.project)
     svc = get_ingestion_service()
     doc_id, indexed, nodes, rels = await svc.ingest_figma(payload)
     return IngestResponse(
@@ -336,7 +342,9 @@ async def ingest_figma(payload: FigmaIngestRequest) -> IngestResponse:  # noqa: 
         "automatically — the user reviews/edits it, then calls POST /ingest/figma."
     ),
 )
+@limiter.limit(settings.rate_limit_vision)
 async def figma_from_image(
+    request: Request,
     file: UploadFile = File(
         ...,
         description="Screenshot of the UI. Accepts PNG, JPEG, or WEBP.",
@@ -350,18 +358,7 @@ async def figma_from_image(
         description="Module this screen belongs to (e.g. 'Catalog'). Optional here; required on final ingest.",
     ),
 ) -> FigmaFromImageResponse:
-    allowed = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
-    mime = (file.content_type or "").lower()
-    if mime not in allowed:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported image type '{mime}'. Use PNG, JPEG, or WEBP.",
-        )
-    raw = await file.read()
-    if not raw:
-        raise HTTPException(status_code=422, detail="Empty image upload")
-    if len(raw) > 8 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Image exceeds 8 MB")
+    raw, mime = await read_and_validate(file, kinds={"image"})
 
     extractor = get_figma_screenshot_extractor()
     try:
@@ -436,7 +433,9 @@ def _default_screen_name(file_name: str) -> str:
         "  (`[\"Login\",\"Home\"]`) or newline/comma-separated values."
     ),
 )
+@limiter.limit(settings.rate_limit_vision)
 async def ingest_figma_from_images(
+    request: Request,
     files: list[UploadFile] = File(
         ...,
         description="One or more UI screenshots. Use the same field name 'files' for each.",
@@ -468,55 +467,38 @@ async def ingest_figma_from_images(
         )
     if not project.strip():
         raise HTTPException(status_code=422, detail="`project` is required")
-    project = get_project_service().require(project)
+    project = await get_project_service().require_async(project)
 
     per_file_names = _parse_repeatable_form(screen_names, len(files))
     per_file_modules = _parse_repeatable_form(modules, len(files))
     default_module_clean = (default_module or "").strip()
 
     # Preload file bytes once (UploadFile reads must happen on the request task).
-    loaded: list[tuple[str, str, bytes]] = []  # (file_name, mime, bytes)
+    loaded: list[tuple[str, str, bytes, str | None]] = []  # (file_name, mime, bytes, error)
     for f in files:
         file_name = f.filename or "upload"
-        mime = (f.content_type or "").lower()
-        if mime not in _FIGMA_BATCH_ALLOWED_MIMES:
-            loaded.append((file_name, mime, b""))
-            continue
-        raw = await f.read()
-        loaded.append((file_name, mime, raw))
+        try:
+            raw, mime = await read_and_validate(f, kinds={"image"})
+            loaded.append((file_name, mime, raw, None))
+        except HTTPException as exc:
+            loaded.append((file_name, (f.content_type or "").lower(), b"", str(exc.detail)))
 
     extractor = get_figma_screenshot_extractor()
     svc = get_ingestion_service()
     sem = asyncio.Semaphore(_FIGMA_BATCH_CONCURRENCY)
 
     async def process_one(idx: int) -> FigmaBatchResult:
-        file_name, mime, raw = loaded[idx]
+        file_name, mime, raw, load_error = loaded[idx]
         screen_name = (per_file_names[idx] or "").strip() or _default_screen_name(file_name)
         module = (per_file_modules[idx] or "").strip() or default_module_clean
 
-        if mime not in _FIGMA_BATCH_ALLOWED_MIMES:
+        if load_error:
             return FigmaBatchResult(
                 ok=False,
                 file_name=file_name,
                 screen_name=screen_name,
                 module=module,
-                error=f"Unsupported image type '{mime}'. Use PNG, JPEG, or WEBP.",
-            )
-        if not raw:
-            return FigmaBatchResult(
-                ok=False,
-                file_name=file_name,
-                screen_name=screen_name,
-                module=module,
-                error="Empty image upload",
-            )
-        if len(raw) > _FIGMA_BATCH_MAX_BYTES:
-            return FigmaBatchResult(
-                ok=False,
-                file_name=file_name,
-                screen_name=screen_name,
-                module=module,
-                error=f"Image exceeds {_FIGMA_BATCH_MAX_BYTES // (1024 * 1024)} MB",
+                error=load_error,
             )
 
         async with sem:
@@ -643,7 +625,8 @@ async def ingest_figma_from_images(
         "- Embeds a flattened textual summary of the spec into Pinecone for retrieval."
     ),
 )
-async def ingest_apis(payload: ApiSpecIngestRequest) -> IngestResponse:
+@limiter.limit(settings.rate_limit_ingest)
+async def ingest_apis(request: Request, payload: ApiSpecIngestRequest) -> IngestResponse:
     """
     Field-by-field example:
 
@@ -675,7 +658,7 @@ async def ingest_apis(payload: ApiSpecIngestRequest) -> IngestResponse:
 
     - **metadata** — freeform. Example: `{"version": "1.4", "owner": "sales-platform"}`
     """
-    payload.project = get_project_service().require(payload.project)
+    payload.project = await get_project_service().require_async(payload.project)
     svc = get_ingestion_service()
     doc_id, indexed, nodes, rels = await svc.ingest_api_spec(payload)
     return IngestResponse(
@@ -705,7 +688,9 @@ _TEXT_FORMATS = {"openapi", "postman", "routes", "text"}
         "Uses the vision LLM. Always review before ingesting."
     ),
 )
+@limiter.limit(settings.rate_limit_ingest)
 async def normalize_api_spec(
+    request: Request,
     format: str = Form(..., description="One of: openapi, postman, routes, text, image"),
     content: str | None = Form(
         default=None,
@@ -731,17 +716,7 @@ async def normalize_api_spec(
         if fmt == "image":
             if file is None:
                 raise HTTPException(status_code=422, detail="`file` is required for format=image")
-            mime = (file.content_type or "").lower()
-            if mime not in {"image/png", "image/jpeg", "image/jpg", "image/webp"}:
-                raise HTTPException(
-                    status_code=415,
-                    detail=f"Unsupported image type '{mime}'. Use PNG, JPEG, or WEBP.",
-                )
-            raw = await file.read()
-            if not raw:
-                raise HTTPException(status_code=422, detail="Empty image upload")
-            if len(raw) > 8 * 1024 * 1024:
-                raise HTTPException(status_code=413, detail="Image exceeds 8 MB")
+            raw, mime = await read_and_validate(file, kinds={"image"})
             spec = await normalize_image(raw, mime)
         else:
             text_payload = await _read_text_payload(content, file)

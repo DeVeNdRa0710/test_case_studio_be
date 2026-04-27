@@ -7,6 +7,7 @@ from pinecone import Pinecone, ServerlessSpec
 
 from app.core.config import settings
 from app.core.logging import logger
+from app.core.resilience import pinecone_breaker, retryable_external, with_breaker
 from app.models.chunk import Chunk, RetrievedChunk
 
 
@@ -48,6 +49,8 @@ class PineconeClient:
         self._index = None
         self._pc = None
 
+    @retryable_external()
+    @with_breaker(pinecone_breaker, "Pinecone")
     async def upsert_chunks(
         self, chunks: Sequence[Chunk], embeddings: Sequence[Sequence[float]], namespace: str = "default"
     ) -> int:
@@ -77,6 +80,8 @@ class PineconeClient:
 
         return await asyncio.to_thread(_upsert)
 
+    @retryable_external()
+    @with_breaker(pinecone_breaker, "Pinecone")
     async def delete_namespace(self, namespace: str) -> int:
         """
         Delete every vector in a namespace. Returns best-effort count of vectors
@@ -103,6 +108,8 @@ class PineconeClient:
 
         return await asyncio.to_thread(_delete)
 
+    @retryable_external()
+    @with_breaker(pinecone_breaker, "Pinecone")
     async def query(
         self,
         vector: Sequence[float],
