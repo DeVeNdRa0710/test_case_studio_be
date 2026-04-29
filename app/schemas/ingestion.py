@@ -9,9 +9,9 @@ class RequirementIngestRequest(BaseModel):
         description="Project (tenant) this document belongs to. Used as the Pinecone namespace and the `project` property on every Neo4j node.",
         examples=["project-one"],
     )
-    module: str = Field(
-        ...,
-        description="ERP module this requirement belongs to. Becomes a Module node in Neo4j and a metadata filter in Pinecone. Example: 'Sales', 'Inventory', 'Finance'.",
+    module: str | None = Field(
+        default=None,
+        description="Optional ERP module. When omitted, the doc is ingested without a :Module link.",
         examples=["Sales"],
     )
     title: str = Field(
@@ -73,6 +73,62 @@ class FigmaIngestRequest(BaseModel):
         description="Freeform extra metadata (figma file id, version, designer, etc.).",
         examples=[{"figma_file": "abc123", "version": "v3"}],
     )
+
+
+class FigmaUrlIngestRequest(BaseModel):
+    project: str = Field(
+        ...,
+        description="Project (tenant) this screen belongs to.",
+        examples=["project-one"],
+    )
+    module: str | None = Field(
+        default=None,
+        description="Optional ERP module. When omitted we derive it from the Figma file name.",
+        examples=["Sales"],
+    )
+    screen_name: str | None = Field(
+        default=None,
+        description="Optional screen name. When omitted we use the targeted Figma node's name (or the file name if no node-id).",
+        examples=["NewOrderScreen"],
+    )
+    figma_url: str = Field(
+        ...,
+        description=(
+            "Public or shared Figma URL. Accepts /design/<fileKey>/...?node-id=<id>, "
+            "/file/<fileKey>/..., and branch URLs."
+        ),
+        examples=["https://www.figma.com/design/abc123XYZ/My-Designs?node-id=1-23"],
+    )
+    figma_token: str | None = Field(
+        default=None,
+        description=(
+            "Figma personal access token. Optional — falls back to the server's "
+            "FIGMA_TOKEN env var. Required if the server has no default token configured."
+        ),
+    )
+    auto_ingest: bool = Field(
+        default=True,
+        description="When true (default), the fetched tree is written to Pinecone + Neo4j immediately.",
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Freeform extra metadata (figma file id, version, designer, etc.).",
+        examples=[{"version": "v3"}],
+    )
+
+
+class FigmaFromUrlResponse(BaseModel):
+    ok: bool = True
+    figma_json: dict[str, Any]
+    screen_name: str
+    module: str
+    file_key: str
+    node_id: str | None = None
+    ingested: bool = False
+    doc_id: str | None = None
+    chunks_indexed: int = 0
+    nodes_upserted: int = 0
+    relationships_upserted: int = 0
 
 
 class ApiSpecIngestRequest(BaseModel):
@@ -145,27 +201,3 @@ class BatchIngestResponse(BaseModel):
     totals: BatchTotals
 
 
-class FigmaBatchResult(BaseModel):
-    ok: bool = Field(..., description="True if this image was extracted (and ingested, if auto_ingest=true).")
-    file_name: str = Field(..., description="Original uploaded filename.")
-    screen_name: str = Field(..., description="Screen name used for this image.")
-    module: str = Field(..., description="Module this screen was attached to.")
-    figma_json: dict[str, Any] | None = Field(
-        default=None,
-        description="Extracted UI tree. Present on success, null on failure.",
-    )
-    ingested: bool = Field(default=False, description="True if the screen was written to Pinecone + Neo4j.")
-    doc_id: str | None = Field(default=None, description="Pinecone doc id when ingested.")
-    chunks_indexed: int = 0
-    nodes_upserted: int = 0
-    relationships_upserted: int = 0
-    error: str | None = Field(default=None, description="Error message when this image failed.")
-
-
-class FigmaBatchResponse(BaseModel):
-    ok: bool = True
-    total_files: int
-    succeeded: int
-    failed: int
-    results: list[FigmaBatchResult]
-    totals: BatchTotals

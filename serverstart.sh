@@ -1,11 +1,26 @@
-!#/bin/bash
+#!/bin/bash
+set -e
 
-# git pull origin master
+# Create venv only if not exists
+if [ ! -d "venv" ]; then
+  python3 -m venv venv
+fi
 
-python3 -m venv venv
+# Activate venv
 source venv/bin/activate
-pip3 install -r requirements.txt
 
-alembic upgrade head
+# Install deps
+pip install -r requirements.txt
 
-python3 -m uvicorn app.main:app --reload --port 8080
+# Run migrations (only if configured)
+if [ -f "alembic.ini" ]; then
+  alembic upgrade head
+else
+  echo "Skipping migrations (no alembic.ini found)"
+fi
+
+# Kill existing process on port 8080
+fuser -k 8080/tcp || true
+
+# Start server
+uvicorn app.main:app --reload --port 8080

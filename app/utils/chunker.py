@@ -204,6 +204,35 @@ def _split_oversized_paragraph(text: str, max_units: int, overlap_units: int) ->
     return out
 
 
+def _split_oversized_list(text: str, max_units: int) -> list[str]:
+    """Line-aware split for list blocks that exceed the budget. Each list item
+    is kept whole; we just pack as many items as fit per chunk. A single item
+    larger than max_units is force-split via the paragraph windower."""
+    out: list[str] = []
+    buf: list[str] = []
+    buf_units = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        line_units = _measure(line)
+        if line_units > max_units:
+            if buf:
+                out.append("\n".join(buf))
+                buf = []
+                buf_units = 0
+            out.extend(_split_oversized_paragraph(line, max_units, 0))
+            continue
+        if buf_units + line_units > max_units and buf:
+            out.append("\n".join(buf))
+            buf = []
+            buf_units = 0
+        buf.append(line)
+        buf_units += line_units
+    if buf:
+        out.append("\n".join(buf))
+    return out
+
+
 def _heading_path(headings: list[tuple[int, str]]) -> str:
     return " > ".join(h[1] for h in headings) if headings else ""
 
@@ -256,6 +285,12 @@ def _pack_section(
             yield from flush()
             for piece in _split_oversized_paragraph(block.text, max_units, overlap_units):
                 yield piece, {**base_meta, "block_kind": "paragraph"}
+            continue
+
+        if block_units > max_units and block.kind == "list":
+            yield from flush()
+            for piece in _split_oversized_list(block.text, max_units):
+                yield piece, {**base_meta, "block_kind": "list"}
             continue
 
         if buf_units + block_units > max_units and buf:

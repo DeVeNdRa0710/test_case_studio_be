@@ -91,7 +91,7 @@ async def generate_testcases(request: Request, payload: GenerateTestCasesRequest
     response_model=GeneratePlaywrightResponse,
     summary="Emit Playwright spec files from test cases",
     description=(
-        "Deterministic (no-LLM) emitter. Each test case → one `.spec.ts` file.\n\n"
+        "Deterministic (no-LLM) emitter. Each test case → one `.spec.js` file.\n\n"
         "Action mapping:\n"
         "- navigate → page.goto\n"
         "- enter    → page.fill\n"
