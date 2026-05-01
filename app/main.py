@@ -3,11 +3,16 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from app.api.router import api_router
 from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging, logger
+from app.core.rate_limit import limiter, rate_limit_exceeded_handler
+from app.db.migrate import import_legacy_projects
+from app.db.session import init_db
 from app.rag.graph.neo4j_client import get_neo4j_client
 from app.rag.vector.pinecone_client import get_pinecone_client
 
@@ -39,6 +44,13 @@ def allowed_origins() -> list[str]:
 async def lifespan(_: FastAPI):
     configure_logging()
     logger.info(f"Starting {settings.app_name} ({settings.app_env})")
+
+    try:
+        await init_db()
+        await import_legacy_projects()
+    except Exception as exc:
+        logger.error(f"DB init/migrate failed: {exc}")
+
     pc = get_pinecone_client()
     neo = get_neo4j_client()
     try:
@@ -74,6 +86,11 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
+    logger.info(f"Rate limiting: enabled={settings.rate_limit_enabled}")
 
     register_exception_handlers(app)
     app.include_router(api_router)

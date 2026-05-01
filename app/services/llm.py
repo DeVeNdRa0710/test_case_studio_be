@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from tenacity import retry, stop_after_attempt, wait_exponential
-
 from app.core.config import settings
 from app.core.logging import logger
+from app.core.resilience import llm_breaker, retryable_external, with_breaker
 
 
 class LLMProvider(Protocol):
@@ -29,7 +28,8 @@ class GeminiProvider:
         self._client = genai.Client(api_key=settings.gemini_api_key or "missing")
         self._model = settings.gemini_model or settings.llm_model
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+    @retryable_external()
+    @with_breaker(llm_breaker, "LLM")
     async def complete(
         self,
         system: str,
@@ -64,7 +64,8 @@ class OpenAIProvider:
         self._client = AsyncOpenAI(api_key=settings.openai_api_key or "missing")
         self._model = settings.llm_model
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+    @retryable_external()
+    @with_breaker(llm_breaker, "LLM")
     async def complete(
         self,
         system: str,
@@ -98,7 +99,8 @@ class GroqProvider:
         self._client = AsyncGroq(api_key=settings.groq_api_key or "missing")
         self._model = settings.groq_model
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+    @retryable_external()
+    @with_breaker(llm_breaker, "LLM")
     async def complete(
         self,
         system: str,

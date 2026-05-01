@@ -7,6 +7,11 @@ from app.rag.graph.graph_store import get_graph_store
 from app.rag.vector.vector_store import get_vector_store
 
 
+GRAPH_MENTION_BOOST = 0.05
+MAX_GRAPH_NODES = 30
+MAX_GRAPH_RELATIONSHIPS = 50
+
+
 class HybridRetriever:
     def __init__(self) -> None:
         self._vector = get_vector_store()
@@ -42,11 +47,60 @@ class HybridRetriever:
             logger.warning(f"Graph lookup failed: {exc}")
             graph = {"nodes": [], "relationships": []}
 
+        graph = _cap_graph(graph, MAX_GRAPH_NODES, MAX_GRAPH_RELATIONSHIPS)
+        docs = _boost_docs_by_graph_mentions(docs, graph)
+
         return {
             "documents": docs,
             "graph": graph,
             "merged_context": _merge_context(docs, graph),
         }
+
+
+def _cap_graph(graph: dict[str, Any], max_nodes: int, max_rels: int) -> dict[str, Any]:
+    nodes = graph.get("nodes") or []
+    rels = graph.get("relationships") or []
+    if len(nodes) <= max_nodes and len(rels) <= max_rels:
+        return graph
+
+    capped_nodes = nodes[:max_nodes]
+    kept_names = {n.get("name") for n in capped_nodes if n.get("name")}
+    capped_rels: list[dict[str, Any]] = []
+    for r in rels:
+        if len(capped_rels) >= max_rels:
+            break
+        if r.get("start") in kept_names and r.get("end") in kept_names:
+            capped_rels.append(r)
+
+    if len(nodes) > max_nodes or len(rels) > max_rels:
+        logger.debug(
+            f"graph capped: nodes {len(nodes)}->{len(capped_nodes)}, "
+            f"rels {len(rels)}->{len(capped_rels)}"
+        )
+    return {"nodes": capped_nodes, "relationships": capped_rels}
+
+
+def _boost_docs_by_graph_mentions(
+    docs: list[RetrievedChunk], graph: dict[str, Any]
+) -> list[RetrievedChunk]:
+    if not docs:
+        return docs
+    names = [
+        n.get("name") for n in graph.get("nodes", []) if isinstance(n.get("name"), str) and n.get("name")
+    ]
+    if not names:
+        return docs
+
+    lowered = [n.lower() for n in names]
+    boosted: list[RetrievedChunk] = []
+    for d in docs:
+        text_l = (d.text or "").lower()
+        hits = sum(1 for n in lowered if n in text_l)
+        if hits:
+            d.score = float(d.score) + GRAPH_MENTION_BOOST * hits
+        boosted.append(d)
+    boosted.sort(key=lambda c: c.score, reverse=True)
+    return boosted
 
 
 def _extract_keywords(query: str) -> list[str]:

@@ -1,7 +1,9 @@
+from app.core.config import settings
 from app.core.exceptions import GenerationError
 from app.core.logging import logger
 from app.prompts import TESTCASE_SYSTEM, TESTCASE_USER
 from app.schemas.testcase import GenerateTestCasesRequest, TestCase
+from app.services.cache import get_or_set, make_key
 from app.services.llm import get_llm
 from app.services.retrieval_service import get_retriever
 from app.utils.json_io import extract_json
@@ -15,6 +17,29 @@ class TestCaseService:
     async def generate(
         self, request: GenerateTestCasesRequest
     ) -> tuple[list[TestCase], int, int]:
+        cache_key = make_key(
+            "testcases",
+            settings.llm_provider,
+            settings.llm_model,
+            request.project,
+            request.query,
+            sorted(request.modules or []),
+            request.top_k,
+            request.test_type,
+            request.extra_context or "",
+        )
+
+        async def _produce() -> dict:
+            return await self._generate_uncached(request)
+
+        result, hit = await get_or_set(cache_key, settings.cache_result_ttl, _produce)
+        if hit:
+            logger.info(f"testcase cache hit: project={request.project} query={request.query[:60]!r}")
+
+        test_cases = [TestCase(**c) for c in result["test_cases"]]
+        return test_cases, result["docs_count"], result["nodes_count"]
+
+    async def _generate_uncached(self, request: GenerateTestCasesRequest) -> dict:
         ctx = await self._retriever.retrieve(
             request.query,
             project=request.project,
@@ -54,9 +79,15 @@ class TestCaseService:
         if not isinstance(cases_raw, list):
             raise GenerationError("LLM response missing 'test_cases' array")
 
-        test_cases = [TestCase(**c) for c in cases_raw]
-        logger.info(f"Generated {len(test_cases)} test cases; merged_ctx_len={len(merged)}")
-        return test_cases, len(docs), len(graph.get("nodes", []))
+        test_cases_serialized = [
+            c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in [TestCase(**c) for c in cases_raw]
+        ]
+        logger.info(f"Generated {len(test_cases_serialized)} test cases; merged_ctx_len={len(merged)}")
+        return {
+            "test_cases": test_cases_serialized,
+            "docs_count": len(docs),
+            "nodes_count": len(graph.get("nodes", [])),
+        }
 
 
 def _docs_block(docs) -> str:

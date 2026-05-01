@@ -20,15 +20,36 @@ def extract_json(text: str) -> dict | list:
         except Exception:
             pass
 
-    # Fallback: grab the outermost JSON-looking blob.
-    for opener, closer in (("{", "}"), ("[", "]")):
+    first_struct = next((ch for ch in text if ch in "{["), None)
+    if first_struct == "[":
+        order = (("[", "]"), ("{", "}"))
+    else:
+        order = (("{", "}"), ("[", "]"))
+
+    candidates: list[str] = []
+    for i, (opener, closer) in enumerate(order):
         start = text.find(opener)
         end = text.rfind(closer)
         if start != -1 and end != -1 and end > start:
             candidate = text[start : end + 1]
-            try:
-                return json.loads(candidate)
-            except Exception:
-                continue
+            candidates.append(candidate)
+            if i == 0 or first_struct is None:
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    continue
+
+    try:
+        from json_repair import repair_json
+    except ImportError:
+        raise ValueError("Unable to parse JSON from LLM response")
+
+    for candidate in [*candidates, text]:
+        try:
+            repaired = repair_json(candidate, return_objects=True)
+            if isinstance(repaired, (dict, list)) and repaired:
+                return repaired
+        except Exception:
+            continue
 
     raise ValueError("Unable to parse JSON from LLM response")

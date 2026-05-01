@@ -32,6 +32,11 @@ class GenerationError(AppError):
     code = "generation_error"
 
 
+class ExternalServiceUnavailable(AppError):
+    status_code = 503
+    code = "external_service_unavailable"
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def handle_app_error(_: Request, exc: AppError) -> JSONResponse:

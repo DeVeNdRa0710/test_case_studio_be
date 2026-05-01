@@ -6,6 +6,7 @@ from neo4j import AsyncGraphDatabase
 
 from app.core.config import settings
 from app.core.logging import logger
+from app.core.resilience import neo4j_breaker, retryable_external, with_breaker
 from app.models.graph import GraphExtraction, GraphNode, GraphRelationship
 
 
@@ -69,6 +70,8 @@ class Neo4jClient:
                 except Exception as exc:
                     logger.warning(f"Neo4j composite constraint failed: {exc}")
 
+    @retryable_external()
+    @with_breaker(neo4j_breaker, "Neo4j")
     async def upsert_extraction(
         self, extraction: GraphExtraction, project: str
     ) -> tuple[int, int]:
@@ -121,6 +124,8 @@ class Neo4jClient:
             props=props,
         )
 
+    @retryable_external()
+    @with_breaker(neo4j_breaker, "Neo4j")
     async def delete_project(self, project: str) -> tuple[int, int]:
         """Cascade-delete all nodes (and their relationships) for a project."""
         if self._driver is None:
@@ -139,6 +144,8 @@ class Neo4jClient:
             await session.run(delete_cypher, project=project)
         return nodes, rels
 
+    @retryable_external()
+    @with_breaker(neo4j_breaker, "Neo4j")
     async def fetch_dependencies(
         self,
         project: str,

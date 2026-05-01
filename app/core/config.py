@@ -74,6 +74,24 @@ class Settings:
     chunk_overlap: int
     top_k: int
 
+    redis_url: str
+    cache_embed_ttl: int
+    cache_result_ttl: int
+    cache_enabled: bool
+
+    rate_limit_enabled: bool
+    rate_limit_generate: str
+    rate_limit_ingest: str
+    rate_limit_vision: str
+
+    max_upload_bytes: int
+    max_image_bytes: int
+    max_pdf_pages: int
+
+    database_url: str
+
+    job_ttl_seconds: int
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -115,6 +133,24 @@ def get_settings() -> Settings:
         chunk_size=_get_int("CHUNK_SIZE", 800),
         chunk_overlap=_get_int("CHUNK_OVERLAP", 120),
         top_k=_get_int("TOP_K", 6),
+
+        redis_url=_get("REDIS_URL"),
+        cache_embed_ttl=_get_int("CACHE_EMBED_TTL", 3600),
+        cache_result_ttl=_get_int("CACHE_RESULT_TTL", 900),
+        cache_enabled=_get("CACHE_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
+
+        rate_limit_enabled=_get("RATE_LIMIT_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
+        rate_limit_generate=_get("RATE_LIMIT_GENERATE", "10/minute"),
+        rate_limit_ingest=_get("RATE_LIMIT_INGEST", "30/minute"),
+        rate_limit_vision=_get("RATE_LIMIT_VISION", "15/minute"),
+
+        max_upload_bytes=_get_int("MAX_UPLOAD_BYTES", 20 * 1024 * 1024),
+        max_image_bytes=_get_int("MAX_IMAGE_BYTES", 8 * 1024 * 1024),
+        max_pdf_pages=_get_int("MAX_PDF_PAGES", 200),
+
+        database_url=_get("DATABASE_URL", "sqlite+aiosqlite:///./data/app.db"),
+
+        job_ttl_seconds=_get_int("JOB_TTL_SECONDS", 24 * 3600),
     )
 
 

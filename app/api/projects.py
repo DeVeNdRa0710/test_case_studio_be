@@ -52,7 +52,8 @@ class DeleteProjectResponse(BaseModel):
 )
 async def list_projects() -> ProjectListResponse:
     svc = get_project_service()
-    return ProjectListResponse(projects=[Project(**p) for p in svc.list_projects()])
+    rows = await svc.list_projects_async()
+    return ProjectListResponse(projects=[Project(**p) for p in rows])
 
 
 @router.post(
@@ -69,7 +70,7 @@ async def list_projects() -> ProjectListResponse:
 async def create_project(payload: CreateProjectRequest) -> Project:
     svc = get_project_service()
     try:
-        project = svc.create(payload.name, payload.description)
+        project = await svc.create_async(payload.name, payload.description)
     except ProjectAlreadyExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ProjectError as exc:
