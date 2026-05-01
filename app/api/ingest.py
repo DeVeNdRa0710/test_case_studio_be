@@ -1,4 +1,3 @@
-import asyncio
 import json
 from typing import Any
 
@@ -14,9 +13,9 @@ from app.schemas.ingestion import (
     BatchDocResult,
     BatchIngestResponse,
     BatchTotals,
-    FigmaBatchResponse,
-    FigmaBatchResult,
+    FigmaFromUrlResponse,
     FigmaIngestRequest,
+    FigmaUrlIngestRequest,
     IngestResponse,
     RequirementIngestRequest,
 )
@@ -28,7 +27,11 @@ from app.services.api_normalizer import (
     from_routes,
     from_text,
 )
-from app.services.figma_extractor import get_figma_screenshot_extractor
+from app.services.figma_api import (
+    FigmaAuthError,
+    FigmaNotFoundError,
+    figma_url_to_tree,
+)
 from app.services.ingestion_service import get_ingestion_service
 from app.services.project_service import get_project_service
 from app.services.vision import LLMModelNotFoundError, LLMQuotaError
@@ -36,13 +39,6 @@ from app.utils.pdf import extract_text_from_pdf
 from app.utils.uploads import assert_pdf_page_limit, read_and_validate
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
-
-
-class FigmaFromImageResponse(BaseModel):
-    ok: bool = True
-    figma_json: dict[str, Any]
-    screen_name: str
-    module: str
 
 
 class NormalizeApiSpecResponse(BaseModel):
@@ -142,9 +138,9 @@ async def ingest_requirements(
             doc_id=doc_id, chunks_indexed=indexed, nodes_upserted=nodes, relationships_upserted=rels
         )
 
-    if not project or not module or not title:
+    if not project or not title:
         raise HTTPException(
-            status_code=422, detail="`project`, `module`, and `title` are required"
+            status_code=422, detail="`project` and `title` are required"
         )
     project = await get_project_service().require_async(project)
 
@@ -190,7 +186,10 @@ async def ingest_requirements_batch(
         description="One or more .pdf or .txt files. Use the same field name 'files' for each.",
     ),
     project: str = Form(..., description="Project (tenant) name applied to every file."),
-    module: str = Form(..., description="ERP module applied to every file."),
+    module: str | None = Form(
+        default=None,
+        description="Optional ERP module applied to every file.",
+    ),
     title_prefix: str | None = Form(
         default=None,
         description="Optional prefix prepended to each file's filename-derived title.",
@@ -202,14 +201,15 @@ async def ingest_requirements_batch(
 ) -> BatchIngestResponse:
     if not files:
         raise HTTPException(status_code=422, detail="At least one file is required")
-    if not project.strip() or not module.strip():
-        raise HTTPException(status_code=422, detail="`project` and `module` are required")
+    if not project.strip():
+        raise HTTPException(status_code=422, detail="`project` is required")
     project = await get_project_service().require_async(project)
 
     svc = get_ingestion_service()
     results: list[BatchDocResult] = []
     totals = BatchTotals()
     prefix = (title_prefix or "").strip()
+    module_clean = (module or "").strip() or None
 
     for f in files:
         file_name = f.filename or "upload"
@@ -228,7 +228,7 @@ async def ingest_requirements_batch(
 
             doc_id, indexed, nodes, rels = await svc.ingest_requirement_text(
                 project=project,
-                module=module.strip(),
+                module=module_clean,
                 title=title,
                 content=content,
                 source=(source or "").strip() or None,
@@ -274,344 +274,85 @@ async def ingest_requirements_batch(
 
 
 @router.post(
-    "/figma",
-    response_model=IngestResponse,
-    summary="Ingest a Figma screen (preprocessed JSON)",
+    "/figma/from-url",
+    response_model=FigmaFromUrlResponse,
+    summary="Fetch a Figma design directly from its URL via Figma's REST API",
     description=(
-        "Takes a preprocessed Figma export and registers the screen in both stores.\n\n"
-        "- Pinecone: the flattened UI element tree is chunked + embedded.\n"
-        "- Neo4j: creates a (:UIScreen {name: screen_name})-[:DEPENDS_ON]->(:Module) edge "
-        "and extracts any additional Entity/API references mentioned in the description."
+        "Pulls the actual Figma node tree using the Figma REST API — no screenshots, "
+        "no preprocessed JSON. Provide a `figma_url` and an access token (in the body "
+        "or via the server's `FIGMA_TOKEN` env var).\n\n"
+        "Supported URL shapes:\n"
+        "- `https://www.figma.com/design/<fileKey>/<name>?node-id=<id>` (preferred — fetches just that frame)\n"
+        "- `https://www.figma.com/design/<fileKey>/<name>` (no node-id — fetches the whole document)\n"
+        "- `https://www.figma.com/file/<fileKey>/...` (legacy)\n"
+        "- branch URLs `/design/<fileKey>/branch/<branchKey>/<name>`\n\n"
+        "When `auto_ingest=true` (default), the fetched tree is written to Pinecone + Neo4j "
+        "as a `:UIScreen`. When false, it's returned for review only."
     ),
 )
 @limiter.limit(settings.rate_limit_ingest)
-async def ingest_figma(request: Request, payload: FigmaIngestRequest) -> IngestResponse:  # noqa: D401
-    """
-    Field-by-field example:
-
-    - **module** — ERP module this screen belongs to.
-      Example: `"Sales"`
-
-    - **screen_name** — canonical name. Becomes a unique :UIScreen node.
-      Example: `"NewOrderScreen"`, `"CustomerList"`, `"InvoiceDetail"`
-
-    - **figma_json** — the preprocessed Figma tree. The service walks
-      `name` / `type` / `children`.
-      Example:
-      ```json
-      {
-        "name": "NewOrder",
-        "type": "FRAME",
-        "children": [
-          {"type": "INPUT",  "name": "customer"},
-          {"type": "INPUT",  "name": "itemSku"},
-          {"type": "BUTTON", "name": "confirm"},
-          {"type": "LABEL",  "name": "orderTotal"}
-        ]
-      }
-      ```
-
-    - **metadata** — freeform. Example: `{"figma_file": "abc123", "version": "v3"}`
-
-    Full payload example:
-    ```json
-    {
-      "module": "Sales",
-      "screen_name": "NewOrderScreen",
-      "figma_json": { "...": "..." },
-      "metadata": {"figma_node_id": "1:42"}
-    }
-    ```
-    """
+async def ingest_figma_from_url(
+    request: Request, payload: FigmaUrlIngestRequest
+) -> FigmaFromUrlResponse:
     payload.project = await get_project_service().require_async(payload.project)
-    svc = get_ingestion_service()
-    doc_id, indexed, nodes, rels = await svc.ingest_figma(payload)
-    return IngestResponse(
-        doc_id=doc_id, chunks_indexed=indexed, nodes_upserted=nodes, relationships_upserted=rels
-    )
 
+    # Token is optional — only protected Figma files need it. We pass through
+    # whatever's provided (request → env fallback → none) and let the Figma API
+    # tell us if auth is actually required.
+    token = (payload.figma_token or "").strip() or settings.figma_token
 
-@router.post(
-    "/figma/from-image",
-    response_model=FigmaFromImageResponse,
-    summary="Auto-generate Figma JSON from a screenshot (vision LLM)",
-    description=(
-        "Upload a screenshot of a UI (web page, mobile screen, or Figma design). "
-        "A vision LLM identifies the visible elements and returns a simplified "
-        "Figma-style JSON tree {name, type, children}. The response is NOT ingested "
-        "automatically — the user reviews/edits it, then calls POST /ingest/figma."
-    ),
-)
-@limiter.limit(settings.rate_limit_vision)
-async def figma_from_image(
-    request: Request,
-    file: UploadFile = File(
-        ...,
-        description="Screenshot of the UI. Accepts PNG, JPEG, or WEBP.",
-    ),
-    screen_name: str = Form(
-        default="Screen",
-        description="Canonical name for the extracted screen (e.g. 'SearchPage').",
-    ),
-    module: str = Form(
-        default="",
-        description="Module this screen belongs to (e.g. 'Catalog'). Optional here; required on final ingest.",
-    ),
-) -> FigmaFromImageResponse:
-    raw, mime = await read_and_validate(file, kinds={"image"})
-
-    extractor = get_figma_screenshot_extractor()
     try:
-        tree = await extractor.extract(
-            image_bytes=raw,
-            mime_type=mime,
-            screen_name=screen_name.strip() or "Screen",
-            module=module.strip(),
+        fetched = await figma_url_to_tree(
+            figma_url=payload.figma_url,
+            token=token,
+            screen_name=payload.screen_name,
+            module=payload.module,
         )
-    except LLMQuotaError as exc:
-        raise HTTPException(status_code=429, detail=str(exc)) from exc
-    except LLMModelNotFoundError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    logger.info(
-        f"Figma JSON extracted from image: screen={screen_name} "
-        f"root_children={len(tree.get('children', []))}"
+    except FigmaAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except FigmaNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    response = FigmaFromUrlResponse(
+        figma_json=fetched.tree,
+        screen_name=fetched.derived_screen_name,
+        module=fetched.derived_module,
+        file_key=fetched.parts.file_key,
+        node_id=fetched.parts.node_id,
     )
-    return FigmaFromImageResponse(
-        figma_json=tree,
-        screen_name=screen_name.strip() or "Screen",
-        module=module.strip(),
-    )
 
+    if not payload.auto_ingest:
+        return response
 
-_FIGMA_BATCH_ALLOWED_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
-_FIGMA_BATCH_MAX_BYTES = 8 * 1024 * 1024
-_FIGMA_BATCH_MAX_FILES = 20
-_FIGMA_BATCH_CONCURRENCY = 4
-
-
-def _parse_repeatable_form(raw: str | None, count: int) -> list[str]:
-    """Accept either a JSON array or a newline/comma-separated list; pad to `count`."""
-    if not raw:
-        return [""] * count
-    s = raw.strip()
-    values: list[str] = []
-    if s.startswith("["):
-        try:
-            parsed = json.loads(s)
-            if isinstance(parsed, list):
-                values = [str(v or "").strip() for v in parsed]
-        except json.JSONDecodeError:
-            values = []
-    if not values:
-        values = [part.strip() for part in s.replace("\r", "").split("\n") if part.strip()]
-        if len(values) <= 1:
-            values = [part.strip() for part in s.split(",") if part.strip()]
-    if len(values) < count:
-        values = values + [""] * (count - len(values))
-    return values[:count]
-
-
-def _default_screen_name(file_name: str) -> str:
-    base = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
-    return base.strip() or "Screen"
-
-
-@router.post(
-    "/figma/from-images",
-    response_model=FigmaBatchResponse,
-    summary="Extract Figma JSON from multiple screenshots (optionally auto-ingest)",
-    description=(
-        "Upload 1..N UI screenshots. Each image is sent to the vision LLM to produce "
-        "a Figma-style JSON tree, and (when `auto_ingest=true`, the default) each tree "
-        "is written to Pinecone + Neo4j as a :UIScreen.\n\n"
-        "- Vision calls run concurrently (capped) to stay under model rate limits.\n"
-        "- A failure on one image does not abort the batch — failed files appear in "
-        "  `results` with `ok=false` and an `error` message.\n"
-        "- `screen_names` and `modules` are optional; if omitted, the filename "
-        "  (without extension) is used as the screen name and `default_module` as the module.\n"
-        "- `screen_names` and `modules` accept either a JSON array string "
-        "  (`[\"Login\",\"Home\"]`) or newline/comma-separated values."
-    ),
-)
-@limiter.limit(settings.rate_limit_vision)
-async def ingest_figma_from_images(
-    request: Request,
-    files: list[UploadFile] = File(
-        ...,
-        description="One or more UI screenshots. Use the same field name 'files' for each.",
-    ),
-    project: str = Form(..., description="Project (tenant) to ingest into."),
-    default_module: str = Form(
-        "",
-        description="Module used when `modules` is not provided per-file. Required if `auto_ingest=true` and no per-file modules are given.",
-    ),
-    screen_names: str | None = Form(
-        default=None,
-        description="Optional per-file screen names (JSON array or newline/comma-separated). Missing entries fall back to the filename.",
-    ),
-    modules: str | None = Form(
-        default=None,
-        description="Optional per-file modules (JSON array or newline/comma-separated). Missing entries fall back to `default_module`.",
-    ),
-    auto_ingest: bool = Form(
-        default=True,
-        description="When true (default), each extracted tree is written to Pinecone + Neo4j immediately.",
-    ),
-) -> FigmaBatchResponse:
-    if not files:
-        raise HTTPException(status_code=422, detail="At least one file is required")
-    if len(files) > _FIGMA_BATCH_MAX_FILES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Too many files: {len(files)} (max {_FIGMA_BATCH_MAX_FILES} per request)",
-        )
-    if not project.strip():
-        raise HTTPException(status_code=422, detail="`project` is required")
-    project = await get_project_service().require_async(project)
-
-    per_file_names = _parse_repeatable_form(screen_names, len(files))
-    per_file_modules = _parse_repeatable_form(modules, len(files))
-    default_module_clean = (default_module or "").strip()
-
-    # Preload file bytes once (UploadFile reads must happen on the request task).
-    loaded: list[tuple[str, str, bytes, str | None]] = []  # (file_name, mime, bytes, error)
-    for f in files:
-        file_name = f.filename or "upload"
-        try:
-            raw, mime = await read_and_validate(f, kinds={"image"})
-            loaded.append((file_name, mime, raw, None))
-        except HTTPException as exc:
-            loaded.append((file_name, (f.content_type or "").lower(), b"", str(exc.detail)))
-
-    extractor = get_figma_screenshot_extractor()
     svc = get_ingestion_service()
-    sem = asyncio.Semaphore(_FIGMA_BATCH_CONCURRENCY)
-
-    async def process_one(idx: int) -> FigmaBatchResult:
-        file_name, mime, raw, load_error = loaded[idx]
-        screen_name = (per_file_names[idx] or "").strip() or _default_screen_name(file_name)
-        module = (per_file_modules[idx] or "").strip() or default_module_clean
-
-        if load_error:
-            return FigmaBatchResult(
-                ok=False,
-                file_name=file_name,
-                screen_name=screen_name,
-                module=module,
-                error=load_error,
-            )
-
-        async with sem:
-            try:
-                tree = await extractor.extract(
-                    image_bytes=raw,
-                    mime_type=mime,
-                    screen_name=screen_name,
-                    module=module,
-                )
-            except LLMQuotaError as exc:
-                return FigmaBatchResult(
-                    ok=False,
-                    file_name=file_name,
-                    screen_name=screen_name,
-                    module=module,
-                    error=f"Vision LLM quota exhausted: {exc}",
-                )
-            except LLMModelNotFoundError as exc:
-                return FigmaBatchResult(
-                    ok=False,
-                    file_name=file_name,
-                    screen_name=screen_name,
-                    module=module,
-                    error=f"Vision LLM not configured: {exc}",
-                )
-            except Exception as exc:  # noqa: BLE001 - we want per-file isolation
-                logger.error(f"Figma vision extract failed for {file_name}: {exc}")
-                return FigmaBatchResult(
-                    ok=False,
-                    file_name=file_name,
-                    screen_name=screen_name,
-                    module=module,
-                    error=str(exc),
-                )
-
-        if not auto_ingest:
-            return FigmaBatchResult(
-                ok=True,
-                file_name=file_name,
-                screen_name=screen_name,
-                module=module,
-                figma_json=tree,
-                ingested=False,
-            )
-
-        if not module:
-            return FigmaBatchResult(
-                ok=False,
-                file_name=file_name,
-                screen_name=screen_name,
-                module=module,
-                figma_json=tree,
-                error="auto_ingest=true requires a module — pass `default_module` or per-file `modules`.",
-            )
-
-        try:
-            doc_id, indexed, nodes, rels = await svc.ingest_figma(
-                FigmaIngestRequest(
-                    project=project,
-                    module=module,
-                    screen_name=screen_name,
-                    figma_json=tree,
-                    metadata={"source": "batch_from_image", "file_name": file_name},
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"Figma ingest failed for {file_name}: {exc}")
-            return FigmaBatchResult(
-                ok=False,
-                file_name=file_name,
-                screen_name=screen_name,
-                module=module,
-                figma_json=tree,
-                error=f"ingest failed: {exc}",
-            )
-
-        return FigmaBatchResult(
-            ok=True,
-            file_name=file_name,
-            screen_name=screen_name,
-            module=module,
-            figma_json=tree,
-            ingested=True,
-            doc_id=doc_id,
-            chunks_indexed=indexed,
-            nodes_upserted=nodes,
-            relationships_upserted=rels,
+    figma_metadata = {
+        "source": "figma_url",
+        "figma_file_key": fetched.parts.file_key,
+        "figma_node_id": fetched.parts.node_id,
+        "figma_file_name": fetched.file_name,
+        "figma_url": payload.figma_url,
+        **payload.metadata,
+    }
+    doc_id, indexed, nodes, rels = await svc.ingest_figma(
+        FigmaIngestRequest(
+            project=payload.project,
+            module=fetched.derived_module,
+            screen_name=fetched.derived_screen_name,
+            figma_json=fetched.tree,
+            metadata=figma_metadata,
         )
-
-    results = await asyncio.gather(*(process_one(i) for i in range(len(files))))
-
-    totals = BatchTotals()
-    for r in results:
-        totals.chunks_indexed += r.chunks_indexed
-        totals.nodes_upserted += r.nodes_upserted
-        totals.relationships_upserted += r.relationships_upserted
-    succeeded = sum(1 for r in results if r.ok)
-
+    )
+    response.ingested = True
+    response.doc_id = doc_id
+    response.chunks_indexed = indexed
+    response.nodes_upserted = nodes
+    response.relationships_upserted = rels
     logger.info(
-        f"Figma batch: project={project} files={len(files)} "
-        f"succeeded={succeeded} failed={len(files) - succeeded} "
-        f"auto_ingest={auto_ingest}"
+        f"Figma URL ingested: project={payload.project} "
+        f"screen={fetched.derived_screen_name} module={fetched.derived_module} "
+        f"file={fetched.parts.file_key} node={fetched.parts.node_id} doc={doc_id}"
     )
-
-    return FigmaBatchResponse(
-        ok=succeeded > 0,
-        total_files=len(files),
-        succeeded=succeeded,
-        failed=len(files) - succeeded,
-        results=list(results),
-        totals=totals,
-    )
+    return response
 
 
 @router.post(

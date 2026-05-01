@@ -92,6 +92,10 @@ class Settings:
 
     job_ttl_seconds: int
 
+    figma_token: str
+    figma_api_base: str
+    figma_http_timeout: float
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -151,6 +155,10 @@ def get_settings() -> Settings:
         database_url=_get("DATABASE_URL", "sqlite+aiosqlite:///./data/app.db"),
 
         job_ttl_seconds=_get_int("JOB_TTL_SECONDS", 24 * 3600),
+
+        figma_token=_get("FIGMA_TOKEN"),
+        figma_api_base=_get("FIGMA_API_BASE", "https://api.figma.com"),
+        figma_http_timeout=_get_float("FIGMA_HTTP_TIMEOUT", 20.0),
     )
 
 

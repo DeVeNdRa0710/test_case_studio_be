@@ -11,6 +11,24 @@ from app.core.resilience import pinecone_breaker, retryable_external, with_break
 from app.models.chunk import Chunk, RetrievedChunk
 
 
+def _sanitize_metadata(md: dict[str, Any]) -> dict[str, Any]:
+    """Pinecone rejects null values and nested objects. Drop None and stringify
+    anything that's not a primitive / list of strings."""
+    out: dict[str, Any] = {}
+    for k, v in md.items():
+        if v is None:
+            continue
+        if isinstance(v, (str, int, float, bool)):
+            out[k] = v
+        elif isinstance(v, list):
+            cleaned = [str(x) for x in v if x is not None]
+            if cleaned:
+                out[k] = cleaned
+        else:
+            out[k] = str(v)
+    return out
+
+
 class PineconeClient:
     """Thin async-friendly wrapper over Pinecone's sync SDK."""
 
@@ -63,7 +81,7 @@ class PineconeClient:
             {
                 "id": c.id,
                 "values": list(vec),
-                "metadata": {**c.metadata, "text": c.text},
+                "metadata": _sanitize_metadata({**c.metadata, "text": c.text}),
             }
             for c, vec in zip(chunks, embeddings)
         ]

@@ -44,7 +44,77 @@ def _esc_regex(value: Any) -> str:
 
 def _needs_login(test_case: TestCase) -> bool:
     text = " ".join(test_case.preconditions or []).lower()
-    return any(k in text for k in ("logged in", "login", "authenticated", "signed in"))
+    if any(k in text for k in ("logged in", "login", "authenticated", "signed in")):
+        return True
+    return _has_login_shaped_steps(test_case.steps or [])
+
+
+_LOGIN_USER_LABEL_RE = re.compile(
+    r"(user.?name|email|user.?id|employee.?id|employee.?code|emp.?id|emp.?code|login|user.?code)",
+    re.IGNORECASE,
+)
+_LOGIN_PASS_LABEL_RE = re.compile(r"(password|passcode|\bpass\b|\bpin\b)", re.IGNORECASE)
+_LOGIN_SUBMIT_LABEL_RE = re.compile(
+    r"(log ?in|sign ?in|submit|continue)", re.IGNORECASE
+)
+
+
+def _looks_like_login_path(target: str) -> bool:
+    t = (target or "").strip().lower()
+    return t in {"/login", "/signin", "/sign-in", "/log-in", "/auth/login", "/auth/signin"}
+
+
+def _step_target_label(step: dict[str, Any]) -> str:
+    """Strip role:/label:/etc. prefix and return the human label, lowercased."""
+    return _strip_prefix(step.get("target") or "").lower()
+
+
+def _is_login_step(step: dict[str, Any]) -> bool:
+    """Heuristic: does this step look like part of a login form interaction?"""
+    action = (step.get("action") or "").lower()
+    if action == "navigate" and _looks_like_login_path(step.get("target") or ""):
+        return True
+    if action == "enter":
+        label = _step_target_label(step)
+        if _LOGIN_USER_LABEL_RE.search(label) or _LOGIN_PASS_LABEL_RE.search(label):
+            return True
+    if action == "click":
+        label = _step_target_label(step)
+        if _LOGIN_SUBMIT_LABEL_RE.search(label):
+            return True
+    return False
+
+
+def _has_login_shaped_steps(steps: list[dict[str, Any]]) -> bool:
+    """True if a head-of-list run of steps looks like a manual login sequence
+    (a username-ish enter and a password-ish enter, optionally bracketed by
+    /login navigate and a sign-in click)."""
+    saw_user = False
+    saw_pass = False
+    for step in steps[:6]:
+        if not _is_login_step(step):
+            break
+        action = (step.get("action") or "").lower()
+        if action == "enter":
+            label = _step_target_label(step)
+            if _LOGIN_USER_LABEL_RE.search(label):
+                saw_user = True
+            elif _LOGIN_PASS_LABEL_RE.search(label):
+                saw_pass = True
+    return saw_user and saw_pass
+
+
+def _strip_leading_login_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove the head-of-list login sequence — the `login(page)` helper in
+    auth.ts handles auth deterministically, so inline login steps are at best
+    redundant and at worst (when the LLM invents field labels like 'Username'
+    that don't match the real form's 'Employee ID') a guaranteed failure."""
+    if not _has_login_shaped_steps(steps):
+        return list(steps)
+    out = list(steps)
+    while out and _is_login_step(out[0]):
+        out.pop(0)
+    return out
 
 
 # ---------------- target parsing ----------------
@@ -233,10 +303,10 @@ def _step_to_line(step: dict[str, Any]) -> str:
 
 def _auth_helper_file(base_url: str | None) -> dict[str, str]:
     base = _esc_ts(base_url or "http://localhost:3000")
-    content = f"""import {{ expect, type Locator, type Page }} from '@playwright/test';
+    content = f"""const {{ expect }} = require('@playwright/test');
 
-export const BASE_URL = process.env.BASE_URL ?? '{base}';
-export const LOGIN_URL = process.env.LOGIN_URL ?? '/login';
+const BASE_URL = process.env.BASE_URL ?? '{base}';
+const LOGIN_URL = process.env.LOGIN_URL ?? '/login';
 
 /**
  * Robust login helper. Tries several field-matching strategies so it works
@@ -249,7 +319,7 @@ export const LOGIN_URL = process.env.LOGIN_URL ?? '/login';
  *   LOGIN_PASSWORD_CSS   (e.g. '#password')
  *   LOGIN_SUBMIT_CSS     (e.g. 'button.signin')
  */
-export async function login(page: Page): Promise<void> {{
+async function login(page) {{
   const username = process.env.APP_USERNAME;
   const password = process.env.APP_PASSWORD;
   if (!username || !password) {{
@@ -266,7 +336,7 @@ export async function login(page: Page): Promise<void> {{
     'username/email/employee-id',
     [
       process.env.LOGIN_USERNAME_CSS
-        ? () => page.locator(process.env.LOGIN_USERNAME_CSS as string)
+        ? () => page.locator(process.env.LOGIN_USERNAME_CSS)
         : null,
       () => page.getByLabel(userPattern),
       () => page.getByPlaceholder(userPattern),
@@ -290,7 +360,7 @@ export async function login(page: Page): Promise<void> {{
     'password',
     [
       process.env.LOGIN_PASSWORD_CSS
-        ? () => page.locator(process.env.LOGIN_PASSWORD_CSS as string)
+        ? () => page.locator(process.env.LOGIN_PASSWORD_CSS)
         : null,
       () => page.getByLabel(/password|pass|pin/i),
       () => page.getByPlaceholder(/password|pass|pin/i),
@@ -304,7 +374,7 @@ export async function login(page: Page): Promise<void> {{
     'submit',
     [
       process.env.LOGIN_SUBMIT_CSS
-        ? () => page.locator(process.env.LOGIN_SUBMIT_CSS as string)
+        ? () => page.locator(process.env.LOGIN_SUBMIT_CSS)
         : null,
       () => page.getByRole('button', {{ name: /log ?in|sign ?in|submit|continue/i }}),
       () =>
@@ -326,12 +396,7 @@ export async function login(page: Page): Promise<void> {{
   await expect(page.locator('input[type="password"]')).toHaveCount(0, {{ timeout: 5000 }});
 }}
 
-async function fillFirst(
-  page: Page,
-  label: string,
-  candidates: Array<(() => Locator) | null>,
-  value: string,
-): Promise<void> {{
+async function fillFirst(page, label, candidates, value) {{
   for (const fn of candidates) {{
     if (!fn) continue;
     try {{
@@ -350,11 +415,7 @@ async function fillFirst(
   );
 }}
 
-async function clickFirst(
-  page: Page,
-  label: string,
-  candidates: Array<(() => Locator) | null>,
-): Promise<void> {{
+async function clickFirst(page, label, candidates) {{
   for (const fn of candidates) {{
     if (!fn) continue;
     try {{
@@ -370,22 +431,25 @@ async function clickFirst(
   await page.locator('input[type="password"]').first().press('Enter');
   void label;
 }}
+
+module.exports = {{ BASE_URL, LOGIN_URL, login }};
 """
-    return {"filename": "auth.ts", "content": content}
+    return {"filename": "auth.js", "content": content}
 
 
 def _spec_file(test_case: TestCase, *, base_url: str | None) -> dict[str, str]:
     title = test_case.scenario or "Scenario"
-    filename = f"tests/{_slug(title)}.spec.ts"
+    filename = f"tests/{_slug(title)}.spec.js"
     needs_login = _needs_login(test_case)
+    steps = _strip_leading_login_steps(test_case.steps or []) if needs_login else list(test_case.steps or [])
     has_navigate = any(
-        (s.get("action") or "").lower() == "navigate" for s in test_case.steps
+        (s.get("action") or "").lower() == "navigate" for s in steps
     )
 
     lines: list[str] = []
-    lines.append("import { test, expect } from '@playwright/test';")
-    lines.append("import { t } from '../runtime';")
-    lines.append("import { BASE_URL, login } from '../auth';")
+    lines.append("const { test, expect } = require('@playwright/test');")
+    lines.append("const { t } = require('../runtime');")
+    lines.append("const { BASE_URL, login } = require('../auth');")
     lines.append("")
     lines.append("test.use({ baseURL: BASE_URL });")
     lines.append("")
@@ -409,7 +473,7 @@ def _spec_file(test_case: TestCase, *, base_url: str | None) -> dict[str, str]:
     if not has_navigate:
         lines.append("  await t.goto(page, '/');")
 
-    for step in test_case.steps:
+    for step in steps:
         lines.append(_step_to_line(step))
 
     if test_case.expected_results:
@@ -426,7 +490,7 @@ def _spec_file(test_case: TestCase, *, base_url: str | None) -> dict[str, str]:
 
 def _runtime_file() -> dict[str, str]:
     content = r"""/**
- * runtime.ts — generic locator helpers shared by every generated test.
+ * runtime.js — generic locator helpers shared by every generated test.
  *
  * Design: tests don't know the target app's DOM, so each helper tries
  * several universal selector strategies in order and returns on the
@@ -434,16 +498,10 @@ def _runtime_file() -> dict[str, str]:
  *
  * Every failure dumps visible page text to help diagnose mismatches.
  */
-import { expect, type Locator, type Page } from '@playwright/test';
+const { expect } = require('@playwright/test');
 
 const DEFAULT_TIMEOUT = 15_000;
 const STRATEGY_TIMEOUT = 2_000;
-
-export interface ClickOptions {
-  in?: 'nav' | 'header' | 'main' | 'dialog' | string;
-  exact?: boolean;
-  timeout?: number;
-}
 
 // Generic English stopwords used only to pick a "content word" when we fall
 // back from a multi-word phrase to a single word. Not tied to any domain.
@@ -452,7 +510,7 @@ const STOPWORDS = new Set([
   'with', 'at', 'and', 'or', 'is', 'be', 'as',
 ]);
 
-function escapeRegex(s: string): string {
+function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
@@ -460,7 +518,7 @@ function escapeRegex(s: string): string {
  * Case-insensitive, whitespace-flexible regex for a label.
  * A label of "Two Words" will match "TwoWords", "Two  Words", "TWO WORDS", etc.
  */
-function labelPattern(label: string, exact = false): RegExp {
+function labelPattern(label, exact = false) {
   const words = label.trim().split(/\s+/).filter(Boolean).map(escapeRegex);
   if (words.length === 0) return /.*/;
   const flex = words.join('\\s*');
@@ -474,10 +532,10 @@ function labelPattern(label: string, exact = false): RegExp {
  *   "Alpha Beta Gamma" ->
  *     ["Alpha Beta Gamma", "Alpha Beta", "Beta Gamma", "Alpha", "Beta", "Gamma"]
  */
-function labelVariants(label: string): string[] {
+function labelVariants(label) {
   const raw = label.trim();
   if (!raw) return [raw];
-  const out = new Set<string>([raw]);
+  const out = new Set([raw]);
   const words = raw.split(/\s+/).filter(Boolean);
   for (let i = words.length - 1; i >= 1; i--) {
     out.add(words.slice(0, i).join(' '));
@@ -494,9 +552,9 @@ function labelVariants(label: string): string[] {
  * plus the two most common class-name conventions (sidebar/navbar, header/topbar,
  * modal/dialog). These are industry-standard UI conventions, not app-specific.
  */
-function scope(page: Page, name?: string): Page | Locator {
+function scope(page, name) {
   if (!name) return page;
-  const map: Record<string, string> = {
+  const map = {
     nav: 'nav, aside, [role="navigation"], [class*="sidebar" i], [class*="nav" i]',
     header: 'header, [role="banner"], [class*="header" i], [class*="topbar" i]',
     main: 'main, [role="main"]',
@@ -506,11 +564,7 @@ function scope(page: Page, name?: string): Page | Locator {
   return page.locator(selector).first();
 }
 
-async function tryStrategy(
-  locatorFn: () => Locator,
-  action: (loc: Locator) => Promise<void>,
-  timeout: number,
-): Promise<boolean> {
+async function tryStrategy(locatorFn, action, timeout) {
   try {
     const loc = locatorFn().first();
     await loc.waitFor({ state: 'visible', timeout });
@@ -521,7 +575,7 @@ async function tryStrategy(
   }
 }
 
-async function dumpVisibleText(page: Page): Promise<string> {
+async function dumpVisibleText(page) {
   try {
     const texts = await page.locator('body *:visible').allTextContents();
     const unique = [
@@ -538,7 +592,33 @@ async function dumpVisibleText(page: Page): Promise<string> {
  * any variant of the label just clicked, click it. Pure structural match —
  * no knowledge of specific actions.
  */
-async function confirmDialogFollowThrough(page: Page, variants: string[]): Promise<void> {
+/**
+ * "any/first/a <something> row|item|record|entry|card" sentinel — when a
+ * generated test asks to click an unspecific row of a list page, we click
+ * the first real (non-header) row. Lets list-page tests run without
+ * hand-coded record IDs.
+ */
+const FIRST_ROW_SENTINEL = /^\s*(any|first|a|the\s+first|the\s+next)\b.*\b(row|record|entry|item|card|line|listing|result)s?\b\.?\s*$/i;
+
+function isFirstRowSentinel(label) {
+  return FIRST_ROW_SENTINEL.test(label || '');
+}
+
+function firstRowCandidates(page) {
+  return [
+    () => page.locator('table tbody tr').first(),
+    () => page.locator('[role="rowgroup"] [role="row"]').first(),
+    () => page.getByRole('row').nth(1),
+    () => page.getByRole('row').first(),
+    () => page.locator('tr:not(:has(th))').first(),
+    () => page.getByRole('listitem').first(),
+    () => page.locator('[role="listitem"], li').first(),
+    () => page.locator('[class*="row" i]:not([class*="header" i])').first(),
+    () => page.locator('[class*="card" i]').first(),
+  ];
+}
+
+async function confirmDialogFollowThrough(page, variants) {
   const dialog = page.locator('[role="dialog"], [role="alertdialog"]').first();
   const isOpen = await dialog.isVisible().catch(() => false);
   if (!isOpen) return;
@@ -547,7 +627,7 @@ async function confirmDialogFollowThrough(page: Page, variants: string[]): Promi
   // universal compact-vs-spaced mismatch ("Logout" <-> "Log Out",
   // "Signup" <-> "Sign Up", "Checkout" <-> "Check Out", etc.) without
   // any word-specific dictionary.
-  const norm = (s: string): string => s.toLowerCase().replace(/\s+/g, '');
+  const norm = (s) => s.toLowerCase().replace(/\s+/g, '');
   const targets = new Set(variants.map(norm).filter((s) => s.length > 0));
 
   const buttons = dialog.getByRole('button');
@@ -569,44 +649,61 @@ async function confirmDialogFollowThrough(page: Page, variants: string[]): Promi
   }
 }
 
-export const t = {
-  async goto(page: Page, path: string): Promise<void> {
+const t = {
+  async goto(page, path) {
     await page.goto(path);
     await this.waitSettled(page);
   },
 
-  async waitSettled(page: Page): Promise<void> {
+  async waitSettled(page) {
     await page.waitForLoadState('networkidle', { timeout: 8_000 }).catch(() => {});
     await page.waitForTimeout(200);
   },
 
-  async click(page: Page, label: string, opts: ClickOptions = {}): Promise<void> {
+  async click(page, label, opts = {}) {
     const deadline = Date.now() + (opts.timeout ?? DEFAULT_TIMEOUT);
     const variants = labelVariants(label);
-    const scopes: Array<Page | Locator> = opts.in ? [scope(page, opts.in), page] : [page];
+    const scopes = opts.in ? [scope(page, opts.in), page] : [page];
+
+    // "any pending X row" / "first record" / "the next item" — click the first
+    // real list row instead of looking for that literal text. Bridges the LLM's
+    // "use a structural placeholder" advice (R6) to a real DOM action.
+    if (isFirstRowSentinel(label)) {
+      for (const fn of firstRowCandidates(page)) {
+        if (Date.now() >= deadline) break;
+        const ok = await tryStrategy(
+          fn,
+          async (loc) => {
+            await loc.click({ force: true });
+          },
+          STRATEGY_TIMEOUT,
+        );
+        if (ok) {
+          await this.waitSettled(page);
+          return;
+        }
+      }
+    }
 
     for (const regionScope of scopes) {
       for (const variant of variants) {
         if (Date.now() >= deadline) break;
         const pattern = labelPattern(variant, opts.exact);
-        const strategies: Array<() => Locator> = [
-          () => (regionScope as Page).getByRole('link', { name: pattern }),
-          () => (regionScope as Page).getByRole('button', { name: pattern }),
-          () => (regionScope as Page).getByRole('menuitem', { name: pattern }),
-          () => (regionScope as Page).getByRole('tab', { name: pattern }),
-          () => (regionScope as Page).getByRole('option', { name: pattern }),
-          () => (regionScope as Page).getByText(pattern).and(page.locator(':visible')),
-          // Clickable ancestor of text, identified by standard interactive
-          // indicators only (ARIA roles, <a>/<button>, tabindex, onclick).
+        const strategies = [
+          () => regionScope.getByRole('link', { name: pattern }),
+          () => regionScope.getByRole('button', { name: pattern }),
+          () => regionScope.getByRole('menuitem', { name: pattern }),
+          () => regionScope.getByRole('tab', { name: pattern }),
+          () => regionScope.getByRole('option', { name: pattern }),
+          () => regionScope.getByText(pattern).and(page.locator(':visible')),
           () =>
-            (regionScope as Page)
+            regionScope
               .getByText(pattern)
               .locator(
                 'xpath=ancestor-or-self::*[self::a or self::button or @role="button" or @role="link" or @role="menuitem" or @role="tab" or @role="option" or @tabindex or @onclick][1]',
               ),
-          // Fallback: nearest block ancestor for SPAs that bind click to plain divs.
           () =>
-            (regionScope as Page)
+            regionScope
               .getByText(pattern)
               .locator('xpath=ancestor-or-self::*[self::div or self::span or self::li][1]'),
         ];
@@ -644,11 +741,11 @@ export const t = {
     );
   },
 
-  async fill(page: Page, fieldLabel: string, value: string): Promise<void> {
+  async fill(page, fieldLabel, value) {
     const variants = labelVariants(fieldLabel);
     for (const variant of variants) {
       const pattern = labelPattern(variant);
-      const strategies: Array<() => Locator> = [
+      const strategies = [
         () => page.getByLabel(pattern),
         () => page.getByPlaceholder(pattern),
         () => page.getByRole('textbox', { name: pattern }),
@@ -656,6 +753,19 @@ export const t = {
           page.locator(
             `input[name*="${escapeRegex(variant)}" i], input[id*="${escapeRegex(variant)}" i], textarea[name*="${escapeRegex(variant)}" i]`,
           ),
+        // Adjacent-label strategy: many SPAs render a <div>/<span> as the
+        // visible label and a separate <input> next to it (no <label for=>).
+        // Find the first input that follows a visible text node matching
+        // the variant — handles the "What?" / "Where?" / "Loss Impact"
+        // pattern in custom-styled forms.
+        () =>
+          page
+            .getByText(pattern)
+            .and(page.locator(':visible'))
+            .locator(
+              'xpath=(./following::input | ./following::textarea | ./parent::*//input | ./parent::*//textarea)[1]',
+            )
+            .first(),
       ];
       for (const strat of strategies) {
         const ok = await tryStrategy(
@@ -674,11 +784,11 @@ export const t = {
     );
   },
 
-  async select(page: Page, fieldLabel: string, value: string): Promise<void> {
+  async select(page, fieldLabel, value) {
     const variants = labelVariants(fieldLabel);
     for (const variant of variants) {
       const pattern = labelPattern(variant);
-      const strategies: Array<() => Locator> = [
+      const strategies = [
         () => page.getByLabel(pattern),
         () => page.getByRole('combobox', { name: pattern }),
         () =>
@@ -704,7 +814,7 @@ export const t = {
    * Tolerant assertion: passes if ANY variant matches a visible heading,
    * visible text, or a URL path slug.
    */
-  async see(page: Page, label: string, timeout = 10_000): Promise<void> {
+  async see(page, label, timeout = 10_000) {
     const variants = labelVariants(label);
     const slugs = variants
       .map((v) => v.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, ''))
@@ -742,9 +852,9 @@ export const t = {
   },
 };
 
-export { expect };
+module.exports = { t, expect };
 """
-    return {"filename": "runtime.ts", "content": content}
+    return {"filename": "runtime.js", "content": content}
 
 
 def _playwright_config_file() -> dict[str, str]:
@@ -763,7 +873,7 @@ export default defineConfig({
   },
 });
 """
-    return {"filename": "playwright.config.ts", "content": content}
+    return {"filename": "playwright.config.js", "content": content}
 
 
 def _package_json_file() -> dict[str, str]:
@@ -836,10 +946,11 @@ npm run report
 ```
 .
 ├── package.json            # dependencies + npm scripts
-├── playwright.config.ts    # Playwright config (timeouts, reporters, …)
-├── auth.ts                 # shared login helper used by all tests
-└── tests/                  # one .spec.ts per test scenario
-    └── *.spec.ts
+├── playwright.config.js    # Playwright config (timeouts, reporters, …)
+├── auth.js                 # shared login helper used by all tests
+├── runtime.js              # shared locator helpers
+└── tests/                  # one .spec.js per test scenario
+    └── *.spec.js
 ```
 
 **Do not move files out of this layout** — each test file imports the login

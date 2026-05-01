@@ -79,11 +79,12 @@ class IngestionService:
         if not payload.content.strip():
             raise IngestionError("Requirement content is empty")
 
+        module = (payload.module or "").strip() or None
         doc_id = f"req_{uuid.uuid4().hex[:10]}"
         metadata = {
             "type": "requirement",
             "project": payload.project,
-            "module": payload.module,
+            "module": module,
             "title": payload.title,
             "source": payload.source or "api",
             **payload.metadata,
@@ -93,16 +94,19 @@ class IngestionService:
         logger.info(f"[{payload.project}] Indexed {indexed} chunks for {doc_id}")
 
         extraction = await self._extractor.extract(
-            text=payload.content, source_type="requirement", modules=[payload.module]
+            text=payload.content,
+            source_type="requirement",
+            modules=[module] if module else [],
         )
-        extraction = _ensure_module(extraction, payload.module)
+        if module:
+            extraction = _ensure_module(extraction, module)
         nodes, rels = await self._graph.upsert(extraction, project=payload.project)
 
         await _record_document(
             doc_id=doc_id,
             project=payload.project,
             kind="requirement",
-            module=payload.module,
+            module=module,
             title=payload.title,
             source=payload.source,
             chunks_indexed=indexed,
@@ -115,7 +119,7 @@ class IngestionService:
         self,
         *,
         project: str,
-        module: str,
+        module: str | None,
         title: str,
         content: str,
         source: str | None = None,
