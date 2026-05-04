@@ -44,9 +44,14 @@ Produce high-signal, executable test cases grounded ONLY in the provided context
 
 Return STRICT JSON with this schema and NOTHING else:
 {{
+  "feature_inventory": [
+    {{"index": 1, "name": "string", "evidence": "string"}}
+  ],
   "test_cases": [
     {{
       "scenario": "string",
+      "feature_index": 1,
+      "slot": 1,
       "modules": ["string"],
       "preconditions": ["string"],
       "steps": [
@@ -66,9 +71,80 @@ Return STRICT JSON with this schema and NOTHING else:
   ]
 }}
 
+`feature_inventory[*].evidence` MUST be a short verbatim quote (route, heading,
+button label, or API path) from the retrieved context that proves the feature
+exists. `test_cases[*].feature_index` MUST match an entry in `feature_inventory`
+and `test_cases[*].slot` MUST be 1..12.
+
 Rules:
 - Generate {test_type} test cases.
-- Cover the golden path AND meaningful edge cases (validation, permissions, concurrency, cross-module effects).
+- DETERMINISTIC COVERAGE MATRIX (mandatory): Coverage is per-feature, not
+  per-request. The total number of test cases scales with how many features
+  the retrieved context actually proves exist — but the formula is fully
+  deterministic, so the same ingested context always yields the same total.
+
+  Step A — FEATURE INVENTORY. Before producing test cases, build an ordered
+  inventory of every distinct, user-facing FEATURE that the retrieved context
+  (vector docs + graph nodes + extra context) proves is implemented. A
+  "feature" is a concrete capability bound to a single primary screen / form /
+  endpoint / workflow that a user invokes (e.g. "Create Sales Order",
+  "Approve Purchase Requisition", "View Invoice List", "Update Profile").
+
+  Inventory rules:
+    a. Order features by first appearance in the retrieved context (top of
+       vector_context first, then graph nodes in label+name lexicographic
+       order, then extra_context). This ordering is what makes the count and
+       the slot assignments stable across runs.
+    b. De-duplicate by canonical feature name (case-insensitive, trimmed).
+    c. Include a feature ONLY if at least ONE of: a route, an API path, a
+       primary heading, a primary button label, or a form label for it
+       appears verbatim in the context. Speculative features (mentioned only
+       as future work, "Coming Soon", "WIP") are excluded — they would
+       otherwise create unreachable tests.
+    d. Filter the inventory to features actually relevant to the user query
+       and the `modules` filter. Out-of-scope features are excluded.
+    e. Emit the inventory as the first element of the JSON response under a
+       top-level `feature_inventory` array (see schema). This makes the count
+       auditable: two runs with the same context MUST produce the same
+       inventory in the same order.
+
+  Step B — PER-FEATURE SLOTS. For EACH feature in the inventory, emit
+  EXACTLY 12 test cases — one per slot below, in this fixed order. Total
+  test_cases length = len(feature_inventory) × 12. Never skip a slot for a
+  feature; never add a 13th slot; never merge two features into one slot.
+
+  If the retrieved context does not contain enough detail to populate a slot
+  fully for a given feature, emit a DEGRADED scenario for that slot —
+  preconditions, plus exactly ONE entry step (a `navigate` to a path proven
+  by the context, OR a `click` on a sidebar/menu label proven by the
+  context — whichever is grounded), plus exactly ONE `validate` step
+  asserting the entry-point element is visible. Prefix the `scenario` name
+  with "[smoke] " so reviewers can see which slots fell back. This keeps the
+  count exact at N×12 regardless of how rich the context is for any
+  individual feature, while still honoring the grounding rules below
+  (especially R7).
+
+    Slot 1  — golden_path           — primary success flow for THIS feature
+    Slot 2  — alternate_path        — a secondary success path / variation
+    Slot 3  — field_validation      — required-field / format-validation rejection
+    Slot 4  — boundary_values       — min/max length, numeric or date boundary
+    Slot 5  — negative_input        — invalid/malformed input rejected by UI or API
+    Slot 6  — state_transition      — lifecycle/status change for the primary entity
+    Slot 7  — cross_module          — downstream effect on a dependent module
+    Slot 8  — authorization         — role-restricted access (degrade per R3 if the
+                                      context only describes one role)
+    Slot 9  — concurrency           — duplicate submit / repeated request idempotency
+    Slot 10 — error_recovery        — server/network error path or retry behavior
+    Slot 11 — data_persistence      — reload / re-open shows the data persisted
+    Slot 12 — smoke_reachability    — bare entry-point load + landed-on-page validate
+
+  Each scenario's `scenario` field MUST start with its feature index and slot
+  tag in square brackets, e.g.
+    "[F1.S1 golden_path] Create Sales Order — happy path"
+    "[F3.S8 authorization][smoke] View Invoice List entry point reachable as accountant"
+  where F<i> is the 1-based index into `feature_inventory` and S<j> is the
+  slot number. This makes the N×12 grid visible in the output and lets QA
+  diff two runs cell-by-cell.
 - Use the graph dependencies to chain modules correctly.
 - Action names must be from the allowed set so they map to Playwright/Postman generators.
 - Do NOT invent APIs or fields not present in the context.

@@ -16,6 +16,8 @@ class LLMProvider(Protocol):
         temperature: float | None = None,
         max_tokens: int | None = None,
         json_mode: bool = False,
+        seed: int | None = None,
+        top_p: float | None = None,
     ) -> str: ...
 
 
@@ -38,15 +40,22 @@ class GeminiProvider:
         temperature: float | None = None,
         max_tokens: int | None = None,
         json_mode: bool = False,
+        seed: int | None = None,
+        top_p: float | None = None,
     ) -> str:
         from google.genai import types
 
-        cfg = types.GenerateContentConfig(
-            system_instruction=system,
-            temperature=temperature if temperature is not None else settings.llm_temperature,
-            max_output_tokens=max_tokens or settings.llm_max_tokens,
-            response_mime_type="application/json" if json_mode else "text/plain",
-        )
+        cfg_kwargs: dict = {
+            "system_instruction": system,
+            "temperature": temperature if temperature is not None else settings.llm_temperature,
+            "max_output_tokens": max_tokens or settings.llm_max_tokens,
+            "response_mime_type": "application/json" if json_mode else "text/plain",
+        }
+        if seed is not None:
+            cfg_kwargs["seed"] = seed
+        if top_p is not None:
+            cfg_kwargs["top_p"] = top_p
+        cfg = types.GenerateContentConfig(**cfg_kwargs)
         resp = await self._client.aio.models.generate_content(
             model=self._model,
             contents=user,
@@ -74,6 +83,8 @@ class OpenAIProvider:
         temperature: float | None = None,
         max_tokens: int | None = None,
         json_mode: bool = False,
+        seed: int | None = None,
+        top_p: float | None = None,
     ) -> str:
         kwargs: dict = {
             "model": self._model,
@@ -86,6 +97,10 @@ class OpenAIProvider:
         }
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        if seed is not None:
+            kwargs["seed"] = seed
+        if top_p is not None:
+            kwargs["top_p"] = top_p
         resp = await self._client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
 
@@ -109,6 +124,8 @@ class GroqProvider:
         temperature: float | None = None,
         max_tokens: int | None = None,
         json_mode: bool = False,
+        seed: int | None = None,
+        top_p: float | None = None,
     ) -> str:
         kwargs: dict = {
             "model": self._model,
@@ -121,6 +138,10 @@ class GroqProvider:
         }
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        if seed is not None:
+            kwargs["seed"] = seed
+        if top_p is not None:
+            kwargs["top_p"] = top_p
         resp = await self._client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
 

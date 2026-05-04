@@ -37,6 +37,14 @@ class GenerateTestCasesRequest(BaseModel):
 
 class TestCase(BaseModel):
     scenario: str = Field(..., description="Short, specific name of the scenario being tested.")
+    feature_index: int | None = Field(
+        default=None,
+        description="1-based index into the response's feature_inventory. Lets QA diff runs cell-by-cell across the per-feature × 12-slot coverage matrix.",
+    )
+    slot: int | None = Field(
+        default=None,
+        description="Coverage-matrix slot 1..12 (1=golden_path, 2=alternate_path, 3=field_validation, 4=boundary_values, 5=negative_input, 6=state_transition, 7=cross_module, 8=authorization, 9=concurrency, 10=error_recovery, 11=data_persistence, 12=smoke_reachability).",
+    )
     modules: list[str] = Field(default_factory=list, description="Modules involved in this scenario.")
     preconditions: list[str] = Field(default_factory=list, description="State/setup that must hold before the steps run.")
     steps: list[dict[str, Any]] = Field(

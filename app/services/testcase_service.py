@@ -68,7 +68,18 @@ class TestCaseService:
             extra_context=request.extra_context or "(none)",
         )
 
-        raw = await self._llm.complete(system, user, json_mode=True)
+        # Determinism: same input must produce the same test cases on every run
+        # and on every machine. Greedy decoding (temperature=0, narrow top_p) plus
+        # a fixed seed removes provider-side sampling variance. The 12-slot matrix
+        # in TESTCASE_SYSTEM separately enforces a constant *count* and coverage.
+        raw = await self._llm.complete(
+            system,
+            user,
+            json_mode=True,
+            temperature=0.0,
+            top_p=0.1,
+            seed=11,
+        )
         try:
             data = extract_json(raw)
         except Exception as exc:
@@ -79,10 +90,27 @@ class TestCaseService:
         if not isinstance(cases_raw, list):
             raise GenerationError("LLM response missing 'test_cases' array")
 
+        inventory = data.get("feature_inventory", []) if isinstance(data, dict) else []
+        feature_count = len(inventory) if isinstance(inventory, list) else 0
+
         test_cases_serialized = [
             c.model_dump() if hasattr(c, "model_dump") else dict(c) for c in [TestCase(**c) for c in cases_raw]
         ]
-        logger.info(f"Generated {len(test_cases_serialized)} test cases; merged_ctx_len={len(merged)}")
+
+        # Determinism check: count must equal features × 12. If the LLM under- or
+        # over-produced (rare with temp=0/seed, but possible if the model
+        # collapsed slots), surface it in logs so QA can spot regressions
+        # instead of silently shipping inconsistent counts.
+        expected = feature_count * 12
+        if feature_count and len(test_cases_serialized) != expected:
+            logger.warning(
+                f"Coverage-matrix count mismatch: features={feature_count} "
+                f"expected={expected} actual={len(test_cases_serialized)}"
+            )
+        logger.info(
+            f"Generated {len(test_cases_serialized)} test cases across "
+            f"{feature_count} features (N×12 matrix); merged_ctx_len={len(merged)}"
+        )
         return {
             "test_cases": test_cases_serialized,
             "docs_count": len(docs),
