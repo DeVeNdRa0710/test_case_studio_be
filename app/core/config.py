@@ -59,6 +59,12 @@ class Settings:
     groq_api_key: str
     groq_model: str
 
+    aws_region: str
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_session_token: str
+    bedrock_model_id: str
+
     pinecone_api_key: str
     pinecone_index: str
     pinecone_cloud: str
@@ -122,6 +128,12 @@ def get_settings() -> Settings:
 
         groq_api_key=_get("GROQ_API_KEY"),
         groq_model=_get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+
+        aws_region=_get("AWS_REGION", "us-east-1"),
+        aws_access_key_id=_get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=_get("AWS_SECRET_ACCESS_KEY"),
+        aws_session_token=_get("AWS_SESSION_TOKEN"),
+        bedrock_model_id=_get("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0"),
 
         pinecone_api_key=_get("PINECONE_API_KEY"),
         pinecone_index=_get("PINECONE_INDEX", "erp-testgen"),
